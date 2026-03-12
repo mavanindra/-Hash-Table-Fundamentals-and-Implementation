@@ -1,121 +1,114 @@
 import java.util.*;
-import java.util.concurrent.*;
-import java.util.concurrent.atomic.*;
+import java.util.concurrent.TimeUnit;
 
-public class DistributedRateLimiter {
-
-    // TokenBucket inner class
-    private static class TokenBucket {
-        private final int maxTokens;
-        private final long refillIntervalMs; // e.g., 1 hour = 3600000ms
-        private AtomicInteger tokens;
-        private long lastRefillTime;
-
-        public TokenBucket(int maxTokens, long refillIntervalMs) {
-            this.maxTokens = maxTokens;
-            this.refillIntervalMs = refillIntervalMs;
-            this.tokens = new AtomicInteger(maxTokens);
-            this.lastRefillTime = System.currentTimeMillis();
-        }
-
-        public synchronized boolean allowRequest() {
-            refillTokens();
-            if (tokens.get() > 0) {
-                tokens.decrementAndGet();
-                return true;
-            }
+class TokenBucket {
+    private int tokens;
+    private long lastRefillTime;
+    private final int maxTokens;
+    private final int refillRatePerSecond; // tokens added per second
+    public TokenBucket(int maxTokens, int refillRatePerHour) {
+        this.maxTokens = maxTokens;
+        this.tokens = maxTokens;
+        this.refillRatePerSecond = refillRatePerHour / 3600; // approximate per second
+        this.lastRefillTime = System.currentTimeMillis();
+    }
+    public synchronized boolean allowRequest() {
+        refill();
+        if (tokens > 0) {
+            tokens--;
+            return true;
+        } else {
             return false;
         }
-
-        public synchronized int getRemainingTokens() {
-            refillTokens();
-            return tokens.get();
-        }
-
-        public synchronized long getResetTimeSeconds() {
-            refillTokens();
-            return (lastRefillTime + refillIntervalMs) / 1000;
-        }
-
-        private void refillTokens() {
-            long now = System.currentTimeMillis();
-            if (now - lastRefillTime >= refillIntervalMs) {
-                tokens.set(maxTokens);
-                lastRefillTime = now;
-            }
+    }
+    private void refill() {
+        long now = System.currentTimeMillis();
+        long elapsedSeconds = (now - lastRefillTime) / 1000;
+        if (elapsedSeconds > 0) {
+            int refillTokens = (int) (elapsedSeconds * refillRatePerSecond);
+            tokens = Math.min(tokens + refillTokens, maxTokens);
+            lastRefillTime = now;
         }
     }
+    public synchronized int getRemainingTokens() {
+        refill();
+        return tokens;
+    }
+    public synchronized long getNextRefillTimeSeconds() {
+        if (tokens > 0) return 0;
+        long now = System.currentTimeMillis();
+        long refillIntervalMs = 1000 / Math.max(refillRatePerSecond,1);
+        return TimeUnit.MILLISECONDS.toSeconds(refillIntervalMs);
+    }
+}
 
-    private final ConcurrentHashMap<String, TokenBucket> clients = new ConcurrentHashMap<>();
-    private final int maxRequests;
-    private final long refillIntervalMs;
-
-    public DistributedRateLimiter(int maxRequestsPerHour) {
-        this.maxRequests = maxRequestsPerHour;
-        this.refillIntervalMs = 60 * 60 * 1000; // 1 hour
+public class DistributedRateLimiter {
+    private HashMap<String, TokenBucket> clients = new HashMap<>();
+    private final int MAX_REQUESTS_PER_HOUR = 1000;
+    public void addClient(String clientId) {
+        clients.put(clientId, new TokenBucket(MAX_REQUESTS_PER_HOUR, MAX_REQUESTS_PER_HOUR));
+        System.out.println("Client added: " + clientId);
     }
 
-    // Check rate limit for a client
     public void checkRateLimit(String clientId) {
-        clients.putIfAbsent(clientId, new TokenBucket(maxRequests, refillIntervalMs));
+        if (!clients.containsKey(clientId)) {
+            System.out.println("Client not found. Adding client.");
+            addClient(clientId);
+        }
         TokenBucket bucket = clients.get(clientId);
-
         boolean allowed = bucket.allowRequest();
-        int remaining = bucket.getRemainingTokens();
-
         if (allowed) {
-            System.out.printf("checkRateLimit(clientId=\"%s\") → Allowed (%d requests remaining)%n",
-                    clientId, remaining);
+            System.out.println("Allowed (" + bucket.getRemainingTokens() + " requests remaining)");
         } else {
-            long resetSeconds = bucket.getResetTimeSeconds() - System.currentTimeMillis() / 1000;
-            System.out.printf("checkRateLimit(clientId=\"%s\") → Denied (0 requests remaining, retry after %ds)%n",
-                    clientId, resetSeconds);
+            System.out.println("Denied (0 requests remaining, retry after ~" + bucket.getNextRefillTimeSeconds() + "s)");
         }
     }
-
-    // Get current status for a client
     public void getRateLimitStatus(String clientId) {
-        clients.putIfAbsent(clientId, new TokenBucket(maxRequests, refillIntervalMs));
+        if (!clients.containsKey(clientId)) {
+            System.out.println("Client not found.");
+            return;
+        }
         TokenBucket bucket = clients.get(clientId);
-        int used = maxRequests - bucket.getRemainingTokens();
-        long reset = bucket.getResetTimeSeconds();
-
-        System.out.printf("getRateLimitStatus(\"%s\") → {used: %d, limit: %d, reset: %d}%n",
-                clientId, used, maxRequests, reset);
+        int used = MAX_REQUESTS_PER_HOUR - bucket.getRemainingTokens();
+        long reset = System.currentTimeMillis() / 1000 + bucket.getNextRefillTimeSeconds();
+        System.out.println("Client: " + clientId);
+        System.out.println("{used: " + used + ", limit: " + MAX_REQUESTS_PER_HOUR +", reset: " + reset + "}");
     }
-
-    // Demo with user input
     public static void main(String[] args) {
         Scanner sc = new Scanner(System.in);
-        DistributedRateLimiter limiter = new DistributedRateLimiter(5); // 5 requests/hour for demo
-
-        System.out.println("Commands: check <clientId> | status <clientId> | exit");
-
+        DistributedRateLimiter rateLimiter = new DistributedRateLimiter();
         while (true) {
-            String line = sc.nextLine().trim();
-            if (line.equalsIgnoreCase("exit")) break;
-
-            String[] parts = line.split("\\s+");
-            if (parts.length != 2) {
-                System.out.println("Invalid command. Format: check <clientId> or status <clientId>");
-                continue;
-            }
-
-            String cmd = parts[0];
-            String clientId = parts[1];
-
-            switch (cmd.toLowerCase()) {
-                case "check":
-                    limiter.checkRateLimit(clientId);
+            System.out.println("\n===== API Gateway Rate Limiter =====");
+            System.out.println("1. Add Client");
+            System.out.println("2. Check Rate Limit");
+            System.out.println("3. Get Rate Limit Status");
+            System.out.println("4. Exit");
+            System.out.print("Enter choice: ");
+            int choice = sc.nextInt();
+            sc.nextLine();
+            switch (choice) {
+                case 1:
+                    System.out.print("Enter Client ID: ");
+                    String clientId = sc.nextLine();
+                    rateLimiter.addClient(clientId);
                     break;
-                case "status":
-                    limiter.getRateLimitStatus(clientId);
+                case 2:
+                    System.out.print("Enter Client ID: ");
+                    clientId = sc.nextLine();
+                    rateLimiter.checkRateLimit(clientId);
                     break;
+                case 3:
+                    System.out.print("Enter Client ID: ");
+                    clientId = sc.nextLine();
+                    rateLimiter.getRateLimitStatus(clientId);
+                    break;
+                case 4:
+                    System.out.println("Exiting...");
+                    sc.close();
+                    return;
                 default:
-                    System.out.println("Unknown command.");
+                    System.out.println("Invalid choice.");
             }
         }
-
-        System.out.println("Exiting...");
     }
 }
